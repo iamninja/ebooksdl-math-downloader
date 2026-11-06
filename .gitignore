@@ -1,1 +1,4 @@
 .claude/
+math_books/
+*.part
+__pycache__/
