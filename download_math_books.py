@@ -13,9 +13,12 @@ Books are saved to ./math_books/<τάξη>/<τίτλος>.pdf
 Already-downloaded files are skipped, so re-running only fetches new books.
 """
 
+import html
+import math
 import re
 import time
-import urllib.parse
+import unicodedata
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -23,6 +26,8 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE = "https://ebooksdl.cti.gr"
+LISTING = f"{BASE}/didaktika_paketa"
+PAGE_SIZE = 9
 DOWNLOAD_DIR = Path("math_books")
 
 SESSION = requests.Session()
@@ -36,14 +41,18 @@ SESSION.headers.update({
     "Accept-Language": "el-GR,el;q=0.9,en-US;q=0.8,en;q=0.7",
 })
 
-MATH_SUBJECTS = [
-    ("Α' Γυμνασίου", "Μαθηματικά (Α' Γυμνασίου)"),
-    ("Β' Γυμνασίου", "Μαθηματικά (Β' Γυμνασίου)"),
-    ("Γ' Γυμνασίου", "Μαθηματικά (Γ' Γυμνασίου)"),
-    ("Α' Λυκείου", "Μαθηματικά (Α' Λυκείου - Γενικής Παιδείας)"),
-    ("Β' Λυκείου", "Μαθηματικά (Β' Λυκείου - Γενικής Παιδείας)"),
-    ("Γ' Λυκείου", "Μαθηματικά (Γ' Λυκείου - Γενικής Παιδείας)"),
-]
+# At Λύκειο level maths is published under its branch names, not "Μαθηματικά".
+MATH_NAME_RE = re.compile(r"μαθηματ|άλγεβρ|γεωμετρ", re.I)
+
+# eduContext codes used by the listing API: 2=Δημοτικό, 3=Γυμνάσιο, 4=Λύκειο.
+EDU_CONTEXTS = ("3", "4")
+
+# Collection names mix Latin lookalikes into Greek text ("A΄ Λυκείου"), which
+# breaks any exact-string comparison; fold them before matching or labelling.
+LATIN_TO_GREEK = str.maketrans({
+    "A": "Α", "B": "Β", "E": "Ε", "H": "Η", "I": "Ι", "K": "Κ", "M": "Μ",
+    "N": "Ν", "O": "Ο", "P": "Ρ", "T": "Τ", "X": "Χ", "Y": "Υ", "Z": "Ζ",
+})
 
 
 def sanitize(s: str) -> str:
@@ -64,39 +73,90 @@ def get_soup(url: str, retries: int = 3, delay: float = 2.0):
     return None
 
 
-def view_links(soup):
-    return [urljoin(BASE, a["href"]) for a in soup.find_all("a", href=re.compile(r"/view\?item="))]
+def clean_text(s: str) -> str:
+    s = unicodedata.normalize("NFC", html.unescape(s or ""))
+    return re.sub(r"\s+", " ", s).strip()
 
 
-def scrape_view_urls_for_subject(subject: str) -> list:
-    params = urllib.parse.urlencode({
-        "filtername": "subject",
-        "filterquery": subject,
-        "filtertype": "equals",
-    })
-    url = f"{BASE}/didaktika_paketa?{params}"
-    print(f"\n  Fetching: {subject}")
-    soup = get_soup(url)
-    if soup is None:
+def fold(s: str) -> str:
+    return clean_text(s).translate(LATIN_TO_GREEK)
+
+
+def api_collections(offset: int, page_total: int) -> dict:
+    payload = {
+        "action": "navigateCollections",
+        "data": {
+            "offset": {"offset": offset},
+            "pageTotal": {"pageTotal": page_total},
+            "filters": {},
+        },
+    }
+    for attempt in range(3):
+        try:
+            r = SESSION.post(LISTING, json=payload, headers={"Referer": LISTING}, timeout=60)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            print(f"    [Error] offset {offset} attempt {attempt + 1}/3: {e}")
+            time.sleep(2.0 * (attempt + 1))
+    return {}
+
+
+def grade_label(name: str) -> str:
+    m = re.search(r"\(([^)]*)\)", fold(name))
+    if not m:
+        return "Χωρίς τάξη"
+    return m.group(1).split(" - ")[0].strip() or "Χωρίς τάξη"
+
+
+def discover_collections() -> list:
+    # The POST API only answers once the session holds the cookie the page sets.
+    SESSION.get(LISTING, timeout=30)
+
+    first = api_collections(0, 1)
+    total = int(first.get("totalCollections") or 0)
+    if not total:
         return []
+    pages = max(1, math.ceil(total / PAGE_SIZE))
+    print(f"  {total} collections across {pages} pages")
 
-    results = view_links(soup)
-    page = 2
-    next_link = soup.find("a", string=re.compile(r"επόμενη", re.I))
-    while next_link and next_link.get("href") and next_link["href"] != "#":
-        soup = get_soup(urljoin(BASE, next_link["href"]))
-        if soup is None:
-            break
-        new = view_links(soup)
-        if not new or set(new) <= set(results):
-            break
-        results.extend(new)
-        next_link = soup.find("a", string=re.compile(r"επόμενη", re.I))
-        page += 1
-        time.sleep(1.0)
+    collections, seen = [], set()
+    batch = first.get("collections", [])
+    for page in range(1, pages + 1):
+        if page > 1:
+            batch = api_collections(PAGE_SIZE * (page - 1), pages).get("collections", [])
+            time.sleep(0.4)
+        if not batch:
+            continue
+        for c in batch:
+            uuid = c.get("collectionUUID")
+            if uuid and uuid not in seen:
+                seen.add(uuid)
+                collections.append(c)
+        print(f"\r  page {page}/{pages} — {len(collections)} collections", end="", flush=True)
+    print()
+    return collections
 
-    print(f"  -> {len(results)} PDF links")
-    return results
+
+def math_view_items(collections: list) -> list:
+    items = []
+    for c in collections:
+        name = clean_text(c.get("name"))
+        if str(c.get("eduContext")) not in EDU_CONTEXTS:
+            continue
+        if not MATH_NAME_RE.search(fold(name)):
+            continue
+        for book in c.get("books", []):
+            for expr in book.get("expressions", []):
+                url = (expr or {}).get("url", "")
+                if "/view?item=" in url:
+                    items.append({
+                        "label": grade_label(name),
+                        "subject": fold(name),
+                        "publisher": clean_text(c.get("publisher")),
+                        "view_url": urljoin(BASE, url),
+                    })
+    return items
 
 
 def resolve_pdf_url(view_url: str):
@@ -153,44 +213,47 @@ def main():
     print("=" * 65)
 
     print("\n[1/3] Discovering books...")
-    items, seen = [], set()
-    for class_label, subject in MATH_SUBJECTS:
-        for v in scrape_view_urls_for_subject(subject):
-            if v not in seen:
-                seen.add(v)
-                items.append((class_label, v))
-        time.sleep(1.0)
+    collections = discover_collections()
+    if not collections:
+        print("\n[!] Could not read the collection listing; try again later.")
+        return
 
-    print(f"\n  Total unique PDF items: {len(items)}")
+    items = math_view_items(collections)
+    by_label = Counter(i["label"] for i in items)
+    print(f"\n  Maths PDF items for Γυμνάσιο & Λύκειο: {len(items)}")
+    for label in sorted(by_label):
+        print(f"    {label}: {by_label[label]}")
     if not items:
-        print("\n[!] Nothing found. The site may be blocking requests; try again later.")
+        print("\n[!] Nothing matched the maths filter.")
         return
 
     print("\n[2/3] Resolving direct PDF links...")
     queue = []
-    for i, (class_label, view_url) in enumerate(items, 1):
-        title, pdf_url = resolve_pdf_url(view_url)
+    for i, item in enumerate(items, 1):
+        title, pdf_url = resolve_pdf_url(item["view_url"])
         print(f"  [{i}/{len(items)}] {title[:60]}" + ("" if pdf_url else "  (no PDF, skipped)"))
         if pdf_url:
-            queue.append((class_label, title, pdf_url, view_url))
+            queue.append({**item, "title": title, "pdf_url": pdf_url})
         time.sleep(0.6)
 
     print(f"\n[3/3] Downloading {len(queue)} PDFs...\n")
     ok, failed = 0, []
-    for i, (class_label, title, pdf_url, view_url) in enumerate(queue, 1):
-        name = sanitize(title) or Path(pdf_url).stem
-        dest = DOWNLOAD_DIR / sanitize(class_label) / f"{name}.pdf"
-        print(f"[{i}/{len(queue)}] {class_label} — {title[:55]}")
-        if download_pdf(pdf_url, dest, referer=view_url):
+    for i, item in enumerate(queue, 1):
+        # Several distinct collections share a title, so key the file on the handle id.
+        handle_id = item["view_url"].rstrip("/").split("/")[-1]
+        name = sanitize(item["title"]) or Path(item["pdf_url"]).stem
+        dest = DOWNLOAD_DIR / sanitize(item["label"]) / f"{name} [{handle_id}].pdf"
+        print(f"[{i}/{len(queue)}] {item['label']} — {item['title'][:55]}")
+        if download_pdf(item["pdf_url"], dest, referer=item["view_url"]):
             ok += 1
         else:
-            failed.append((class_label, title, pdf_url))
+            failed.append(item)
         time.sleep(1.0)
 
     print(f"\n{'=' * 65}")
     print(f"  Done: {ok}/{len(queue)} downloaded to {DOWNLOAD_DIR.resolve()}")
-    for cls, t, u in failed:
-        print(f"  FAILED [{cls}] {t}\n         {u}")
+    for item in failed:
+        print(f"  FAILED [{item['label']}] {item['title']}\n         {item['pdf_url']}")
     print("=" * 65)
 
 

@@ -2,3 +2,4 @@
 math_books/
 *.part
 __pycache__/
+run.log
